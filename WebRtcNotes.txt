@@ -1,0 +1,1 @@
+1. After closing PeerConnection don't forget to remove screen from Stack

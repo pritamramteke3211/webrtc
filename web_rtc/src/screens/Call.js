@@ -1,0 +1,328 @@
+import { ActivityIndicator, DevSettings, Platform, SafeAreaView, StyleSheet, Text, View } from 'react-native'
+import React , { useState, useRef, useEffect } from 'react'
+import Video from '../components/Video'
+import GettingCall from '../components/GettingCall'
+import {MediaStream, RTCPeerConnection, EventOnAddStream, RTCIceCandidate, RTCSessionDescription } from 'react-native-webrtc'
+import Utils from '../Utils'
+import firestore, { FirebaseFirestoreTypes } from '@react-native-firebase/firestore'
+import { StackActions,useFocusEffect } from '@react-navigation/native';
+import getStream from './functions/getStream'
+
+const configuration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
+
+const Call = ({navigation,route}) => {
+
+  const {type, call_req } = route.params
+
+  const [localStream, setlocalStream] = useState()
+  const [remoteStream, setRemoteStream] = useState()
+  const [gettingCall, setGettingCall] = useState(false)
+
+  const pc = useRef();
+  const sender = useRef()
+  const connecting = useRef(false)
+
+  const closePeer = useRef(false)
+
+  const isEmu = Platform.constants.Brand == 'google'
+
+
+  const createConnection = async (cRef) =>{
+    
+    const subscribe = cRef.onSnapshot(snapshot =>  {
+   
+    const data = snapshot.data();
+  
+        // On answer start the call
+        if (pc.current && !pc.current.remoteDescription && data && data.answer) {
+            pc.current.addEventListener('peerConnectionStateChanged',()=>{})
+            pc.current.setRemoteDescription(new RTCSessionDescription(data.answer));
+          
+        }
+  
+        // If there is offer for chatId set the getting call flag
+        if (data && data?.offer && !connecting.current) {
+            setGettingCall(true);  
+        }
+  else
+        if (!connecting.current && !data?.offer) {
+          setGettingCall(false);
+        }});  
+  
+  }
+
+  
+  useEffect(() => {
+    console.log(Platform.constants.Brand,'Call UseEffect')
+    const cRef = firestore().collection('meet').doc('chatId');
+      createConnection(cRef).then(()=>{
+        if (call_req) {
+          create()
+        }
+
+      })
+
+    
+        // On Delete of collection call hangup
+    // The Other side has clicked on hangup
+    const subscribeDelete = cRef.collection('callee').onSnapshot((snapshot) => {
+      snapshot.docChanges().forEach((change) => {
+        
+        if (change.type == 'removed' && pc.current?.connectionState == 'connected' && !closePeer.current) {
+          hangup();
+        }
+      });
+    });
+
+    return () => {
+      subscribeDelete()
+    }
+  }, [])
+  
+
+  const setupWebrtc = async() => {
+
+    pc.current =  new RTCPeerConnection(configuration)
+
+    // Get the audio and video stream for th call
+    const stream = await getStream(type)
+    if (stream) {
+
+      setlocalStream(stream)
+      
+      stream.getTracks().forEach((track)  => {
+        console.log("Track", isEmu)
+        sender.current = pc.current?.addTrack(track, stream)
+      }
+        )
+    }
+
+    pc.current.ontrack = (event) => {
+      setRemoteStream(event.streams[0])
+    }     
+
+  }
+
+  const create = async() => {
+    closePeer.current = false
+    connecting.current = true;
+
+    // setUp webrtc
+    await setupWebrtc();
+
+    // Document for the call
+    const cRef = firestore().collection("meet").doc("chatId");
+    collectIceCandidates(cRef, "caller", "callee");
+    
+    if (pc.current) {
+      // Create the offer for the call
+      // Store the offer under the document
+
+      let sessionConstraints = {
+        mandatory: {
+          OfferToReceiveAudio: true,
+          OfferToReceiveVideo: true,
+          VoiceActivityDetection: true
+        }
+      };
+
+      const offer = await pc.current.createOffer(sessionConstraints);
+      pc.current.setLocalDescription(offer);
+
+      const cWithOffer = {
+        offer: {
+          type: offer.type,
+          sdp: offer.sdp,
+        },
+      };
+
+
+      cRef.set(cWithOffer);
+    }
+
+  };
+
+  const join = async() => {
+
+
+connecting.current = true;
+setGettingCall(false)
+
+const cRef = firestore().collection('meet').doc('chatId');
+const offer = (await cRef.get()).data()?.offer;
+
+
+
+if (offer) {
+
+  
+  // Setup Webrtc
+  await setupWebrtc();
+
+  // Exchange the ICE candidates
+  // Check the parameters, Its reversed. Since the joining part is calle
+   collectIceCandidates(cRef, "callee", "caller");
+
+  if (pc.current) {
+
+ 
+      await pc.current.setRemoteDescription(new RTCSessionDescription(offer));  
+    
+    
+
+    // Create the answer for the call
+    // Update the document with answer
+    const answer = await pc.current.createAnswer();
+    await pc.current.setLocalDescription(answer)
+
+    const cWithAnswer = {
+      answer : {
+        type: answer.type,
+        sdp: answer.sdp,
+      },
+    }
+    cRef.update(cWithAnswer)
+  }
+  }}
+
+  /*
+  * For disconnecting the call close the connection, release the stream 
+  * And delete the document for the call 
+  */
+
+  const hangup = async() => {
+    
+    closePeer.current = true
+    
+    setGettingCall(false)
+    connecting.current = false;
+    await streamCleanUp();
+    await firestoreCleanUp();
+    
+    navigation.dispatch(StackActions.replace('Home'))
+  }
+
+  // Helper function
+  const streamCleanUp = async() => {
+    if (localStream) {
+      localStream.getTracks().forEach((t) => t.stop());
+      localStream.release();
+      
+
+      // Close each track
+
+    
+    // Remove all event listeners
+    pc.current.ontrack = null;
+    pc.current.onremovetrack = null;
+    pc.current.onicecandidate = null;
+    pc.current.oniceconnectionstatechange = null;
+    pc.current.onsignalingstatechange = null;
+
+      if (pc.current.connectionState == 'connected' ||
+      pc.current.connectionState == 'failed') {
+
+
+      // Close the connection
+      pc.current.close()
+      pc.current = null
+  }
+    }
+    setlocalStream(null)
+    setRemoteStream(null)
+
+
+  }
+  const firestoreCleanUp = async() => {
+    const cRef = firestore().collection('meet').doc('chatId');
+
+    if (cRef) {
+      const calleeCandidate = await cRef.collection('callee').get();
+      calleeCandidate.forEach(async (candidate) => {
+        await candidate.ref.delete();
+      })
+
+      const callerCandidate = await cRef.collection('caller').get();
+      callerCandidate.forEach(async (candidate) => {
+        await candidate.ref.delete();
+      })
+
+      cRef.delete();
+
+    }
+  }
+
+
+  const collectIceCandidates = async(cRef,
+    localName,
+    remoteName) => {
+     
+      const candidateCollection = cRef.collection(localName);
+  
+      if (pc.current) {
+      
+        // On new ICE candidate add it to firestore
+        try {
+
+          pc.current.addEventListener( 'icecandidate', event => {
+            if (event.candidate) {
+              candidateCollection.add(event.candidate)
+            }
+          } );
+
+          
+        } catch (error) {
+          console.log("H error",error) 
+
+        }       
+      }
+
+      // Get the ICE candidate added to firestore and update the local PC
+if (pc?.current?.connectionState != 'closed') {
+  cRef.collection(remoteName).onSnapshot(snapshot => {
+    snapshot.docChanges().forEach((change) => {
+     
+      if (change.type == 'added') {
+        const candidate = new RTCIceCandidate(change.doc.data())
+        pc.current?.addIceCandidate(candidate)
+      }
+    })
+  })
+
+}
+     
+  }
+
+  //Displays the gettingCall Component
+  if (gettingCall) {
+    return <GettingCall hangup={hangup} join={join} />
+  }
+
+  if (localStream) {
+    return (
+      <Video
+      hangup={hangup}
+      localStream={localStream}
+      remoteStream={remoteStream}
+      />
+    )
+  }
+
+  // Display th call button
+  return (
+    <SafeAreaView style={styles.container}>
+      <ActivityIndicator size={'large'} />
+  </SafeAreaView>
+  )
+}
+
+export default Call
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent:'center',
+  }
+})
